@@ -1,0 +1,59 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: ServerLauncherPython
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build EXE
+        working-directory: ServerLauncherPython
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name ServerLauncherPR `
+            --icon assets/icon.ico `
+            --hidden-import PIL `
+            --add-data "assets/logo_compact.gif;assets" `
+            --add-data "assets/logo_preview.png;assets" `
+            --add-data "assets/logo_ui.png;assets" `
+            --add-data "assets/icon.ico;assets" `
+            --add-data "assets/icon.png;assets" `
+            server_launcher.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerLauncherPR-windows
+          path: ServerLauncherPython/dist/ServerLauncherPR.exe
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Server Launcher v1.0.${{ github.run_number }}
+          body: |
+            Download **ServerLauncherPR.exe** and run it on Windows.
+
+            The app opens Prime Rebar project folders under `Z:\Projects`.
+          files: ServerLauncherPython/dist/ServerLauncherPR.exe
+          make_latest: true

@@ -1,0 +1,15 @@
+.DS_Store
+**/.DS_Store
+**/__pycache__/
+*.py[cod]
+.vs/
+**/bin/
+**/obj/
+*.user
+*.pfx
+ServerLauncherPython/build/
+ServerLauncherPython/dist/
+*.spec
+PrimeRebarAnimatedNewCompressedLogo.webm
+ServerLauncherPython/assets/logo_animated.gif
+test
