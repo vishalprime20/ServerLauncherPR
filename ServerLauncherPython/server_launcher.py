@@ -23,7 +23,7 @@ except ImportError:
 
 DEFAULT_PROJECTS_ROOT = os.environ.get("SERVER_LAUNCHER_ROOT", r"Z:\Projects")
 WINDOW_TITLE = "Server Launcher"
-MAX_RECENTS = 8
+MAX_RECENTS = 24
 LOGO_FPS = 12
 
 BG = "#070707"
@@ -622,6 +622,19 @@ class ServerLauncherApp(tk.Tk):
         self.search_border.pack(side="left", fill="x", expand=True)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._on_search_changed)
+        self.search_clear = tk.Label(
+            self.search_border,
+            text="×",
+            bg="#1C1814",
+            fg=MUTED,
+            font=ui_font(12, "bold"),
+            padx=8,
+            cursor="hand2",
+        )
+        self.search_clear.pack(side="right", fill="y")
+        self.search_clear.bind("<Button-1>", lambda _e: self._clear_search())
+        self.search_clear.bind("<Enter>", lambda _e: self.search_clear.configure(fg=COPPER_HI))
+        self.search_clear.bind("<Leave>", lambda _e: self.search_clear.configure(fg=MUTED))
         self.search_entry = tk.Entry(
             self.search_border,
             textvariable=self.search_var,
@@ -633,7 +646,7 @@ class ServerLauncherApp(tk.Tk):
             highlightthickness=0,
             bd=6,
         )
-        self.search_entry.pack(fill="x")
+        self.search_entry.pack(side="left", fill="x", expand=True)
         self.search_entry.bind("<FocusIn>", self._on_search_focus)
         self.search_entry.bind("<Down>", self._focus_suggestions)
         self.search_entry.bind("<Escape>", lambda _e: self._hide_suggestions())
@@ -712,8 +725,29 @@ class ServerLauncherApp(tk.Tk):
 
         recents_card = tk.Frame(body, bg=LINE)
         recents_card.pack(fill="both", expand=True)
-        self.recents_wrap = tk.Frame(recents_card, bg=PANEL, padx=8, pady=8)
-        self.recents_wrap.pack(fill="both", expand=True, padx=1, pady=1)
+        recents_box = tk.Frame(recents_card, bg=PANEL)
+        recents_box.pack(fill="both", expand=True, padx=1, pady=1)
+        self.recents_canvas = tk.Canvas(recents_box, bg=PANEL, highlightthickness=0, bd=0)
+        self.recents_scroll = tk.Scrollbar(
+            recents_box,
+            orient="vertical",
+            command=self.recents_canvas.yview,
+            bg=PANEL,
+            troughcolor="#0C0C0C",
+            activebackground=COPPER,
+            highlightthickness=0,
+            bd=0,
+            width=12,
+        )
+        self.recents_canvas.configure(yscrollcommand=self.recents_scroll.set)
+        self.recents_scroll.pack(side="right", fill="y")
+        self.recents_canvas.pack(side="left", fill="both", expand=True)
+        self.recents_wrap = tk.Frame(self.recents_canvas, bg=PANEL, padx=8, pady=8)
+        self.recents_window = self.recents_canvas.create_window((0, 0), window=self.recents_wrap, anchor="nw")
+        self.recents_wrap.bind("<Configure>", self._sync_recents_scroll)
+        self.recents_canvas.bind("<Configure>", self._sync_recents_width)
+        self._bind_recents_wheel(self.recents_canvas)
+        self._bind_recents_wheel(self.recents_wrap)
 
         self.status_var = tk.StringVar(value="Ready")
         status_bar = tk.Frame(self.stage, bg="#0C0C0C")
@@ -1052,6 +1086,34 @@ class ServerLauncherApp(tk.Tk):
             return f"{seconds // 3600}h ago"
         return f"{seconds // 86400}d ago"
 
+    def _sync_recents_scroll(self, _event=None) -> None:
+        self.recents_canvas.configure(scrollregion=self.recents_canvas.bbox("all") or (0, 0, 0, 0))
+
+    def _sync_recents_width(self, event: tk.Event) -> None:
+        self.recents_canvas.itemconfigure(self.recents_window, width=event.width)
+
+    def _bind_recents_wheel(self, widget: tk.Misc) -> None:
+        widget.bind("<MouseWheel>", self._on_recents_wheel, add="+")
+        widget.bind("<Button-4>", self._on_recents_wheel, add="+")
+        widget.bind("<Button-5>", self._on_recents_wheel, add="+")
+        for child in widget.winfo_children():
+            self._bind_recents_wheel(child)
+
+    def _on_recents_wheel(self, event: tk.Event):
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self.recents_canvas.yview_scroll(-1, "units")
+        else:
+            self.recents_canvas.yview_scroll(1, "units")
+        return "break"
+
+    def _clear_search(self) -> None:
+        self._ignore_search = True
+        self.search_var.set("")
+        self._ignore_search = False
+        self._hide_suggestions()
+        self.search_entry.focus_set()
+        self._set_status("Project box cleared")
+
     def _refresh_recents(self) -> None:
         for child in self.recents_wrap.winfo_children():
             child.destroy()
@@ -1064,8 +1126,9 @@ class ServerLauncherApp(tk.Tk):
                 fg=MUTED,
                 font=ui_font(9),
             ).pack(anchor="w")
+            self.after_idle(self._sync_recents_scroll)
             return
-        for item in items[:6]:
+        for item in items:
             chip = RecentChip(
                 self.recents_wrap,
                 item.get("key", ""),
@@ -1074,6 +1137,8 @@ class ServerLauncherApp(tk.Tk):
                 self._remove_recent,
             )
             chip.pack(fill="x", pady=3)
+            self._bind_recents_wheel(chip)
+        self.after_idle(self._sync_recents_scroll)
 
     def _remember_recent(self) -> None:
         key = self._project_key()
@@ -1162,7 +1227,7 @@ class ServerLauncherApp(tk.Tk):
 
     def _on_root_click(self, event: tk.Event) -> None:
         widget = event.widget
-        if widget in (self.search_entry, self.suggest_list, self.search_border):
+        if widget in (self.search_entry, self.suggest_list, self.search_border, self.search_clear):
             return
         try:
             if str(widget).startswith(str(self.suggest_win)):
