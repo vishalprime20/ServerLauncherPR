@@ -286,6 +286,10 @@ def normalize_query(text: str) -> str:
     return query.strip()
 
 
+def _search_key(text: str) -> str:
+    return "".join(ch for ch in text.upper() if ch.isalnum())
+
+
 def list_project_names(query: str) -> tuple[list[str], str | None]:
     query = normalize_query(query)
     if len(query) < 1:
@@ -293,8 +297,8 @@ def list_project_names(query: str) -> tuple[list[str], str | None]:
     root, error = get_projects_root()
     if not root:
         return [], error
-    prefix = f"PR#{query}".upper()
-    names: list[str] = []
+    needle = query.upper()
+    needle_key = _search_key(query)
     try:
         entries = os.listdir(root)
     except OSError:
@@ -305,11 +309,22 @@ def list_project_names(query: str) -> tuple[list[str], str | None]:
             entries = os.listdir(root)
         except OSError:
             return [], "Projects folder not found — click ... and select Z:\\Projects"
+    starts: list[str] = []
+    contains: list[str] = []
     for name in entries:
-        if name.upper().startswith(prefix):
-            names.append(name[3:] if name.upper().startswith("PR#") else name)
-    names.sort(key=str.upper)
-    return names, None
+        upper = name.upper()
+        if not upper.startswith("PR#"):
+            continue
+        display = name[3:] if upper.startswith("PR#") else name
+        display_upper = display.upper()
+        folded = _search_key(name)
+        if upper.startswith(f"PR#{needle}") or display_upper.startswith(needle):
+            starts.append(display)
+        elif needle in display_upper or (len(needle_key) >= 2 and needle_key in folded):
+            contains.append(display)
+    starts.sort(key=str.upper)
+    contains.sort(key=str.upper)
+    return starts + contains, None
 
 
 def ui_font(size: int, weight: str = "normal") -> tuple:
@@ -1190,7 +1205,7 @@ class ServerLauncherApp(tk.Tk):
             self._hide_suggestions()
             return
         self.suggest_list.delete(0, tk.END)
-        for name in names[:20]:
+        for name in names[:40]:
             self.suggest_list.insert(tk.END, name)
         self._suggest_visible = True
         self._reposition_suggestions()
