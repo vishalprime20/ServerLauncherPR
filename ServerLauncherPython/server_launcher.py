@@ -518,7 +518,7 @@ class RecentChip(tk.Frame):
             bg=PANEL_ALT,
             fg=MUTED,
             font=ui_font(8),
-            padx=(0, 4),
+            padx=4,
             cursor="hand2",
         )
         close = tk.Label(
@@ -1141,7 +1141,7 @@ class ServerLauncherApp(tk.Tk):
         width = max(self.search_entry.winfo_width(), 240)
         count = max(self.suggest_list.size(), 1)
         height = min(196, 26 * min(count, 7) + 4)
-        self.suggest_win.geometry(f"{width}x{height}+{x}+{y}")
+        self.suggest_win.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
 
     def _hide_suggestions(self) -> None:
         self._suggest_visible = False
@@ -1172,27 +1172,32 @@ class ServerLauncherApp(tk.Tk):
         self._hide_suggestions()
 
     def _opened(self, action: str) -> None:
-        self._remember_recent()
+        try:
+            self._remember_recent()
+        except tk.TclError:
+            pass
         key = self._project_key() or "—"
         self._set_status(f"Opened {action}  ·  PR#{key}")
 
     def _open_single(self, path: str, action: str) -> None:
         try:
             open_path(path)
-            self._opened(action)
         except BaseException as exc:
             self._set_status(f"Failed to open {action}", ok=False)
             show_error(action, exc)
+            return
+        self._opened(action)
 
     def _open_fallback(self, paths: list[str], action: str) -> None:
         last_error: BaseException | None = None
         for path in paths:
             try:
                 open_path(path)
-                self._opened(action)
-                return
             except BaseException as exc:
                 last_error = exc
+                continue
+            self._opened(action)
+            return
         if last_error is not None:
             self._set_status(f"Failed to open {action}", ok=False)
             show_error(action, last_error)
