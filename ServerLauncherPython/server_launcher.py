@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 try:
     from PIL import Image, ImageSequence, ImageTk
@@ -21,7 +21,7 @@ try:
 except ImportError:
     HAS_PIL = False
 
-PROJECTS_ROOT = os.environ.get("SERVER_LAUNCHER_ROOT", r"Z:\Projects")
+DEFAULT_PROJECTS_ROOT = os.environ.get("SERVER_LAUNCHER_ROOT", r"Z:\Projects")
 WINDOW_TITLE = "Server Launcher"
 MAX_RECENTS = 8
 LOGO_FPS = 12
@@ -49,12 +49,203 @@ def asset_path(name: str) -> Path:
 
 
 def recents_file() -> Path:
+    return _config_dir() / "recents.json"
+
+
+def settings_file() -> Path:
+    return _config_dir() / "settings.json"
+
+
+def _config_dir() -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", Path.home())) / "ServerLauncherPR"
     else:
         base = Path.home() / ".server_launcher_pr"
     base.mkdir(parents=True, exist_ok=True)
-    return base / "recents.json"
+    return base
+
+
+def load_settings() -> dict:
+    path = settings_file()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    current = load_settings()
+    current.update(data)
+    settings_file().write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+
+def _dir_accessible(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        os.listdir(path)
+        return True
+    except OSError:
+        pass
+    if sys.platform == "win32":
+        import ctypes
+
+        invalid = 0xFFFFFFFF
+        directory = 0x10
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attrs != invalid and attrs & directory:
+            return True
+    return False
+
+
+def _wake_drive(path: str) -> None:
+    drive = os.path.splitdrive(path)[0]
+    if not drive:
+        return
+    try:
+        os.listdir(drive + os.sep)
+    except OSError:
+        pass
+
+
+def win32_logical_drives() -> list[str]:
+    if sys.platform != "win32":
+        return []
+    import ctypes
+
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    drives = []
+    for index in range(26):
+        if bitmask & (1 << index):
+            drives.append(f"{chr(ord('A') + index)}:\\")
+    return drives
+
+
+def win32_unc_for(drive: str) -> str | None:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    local = drive[:2]
+    buffer = ctypes.create_unicode_buffer(1024)
+    length = wintypes.DWORD(1024)
+    error = ctypes.windll.mpr.WNetGetConnectionW(local, buffer, ctypes.byref(length))
+    if error == 0 and buffer.value:
+        return buffer.value
+    return None
+
+
+def win32_net_use_remote(drive: str) -> str | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        completed = subprocess.run(
+            ["net", "use", drive[:2]],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in (completed.stdout or "").splitlines():
+        for part in line.split():
+            if part.startswith("\\\\"):
+                return part.rstrip("\\")
+    return None
+
+
+def _candidate_project_roots() -> list[str]:
+    candidates: list[str] = []
+    saved = load_settings().get("projects_root")
+    if saved:
+        candidates.append(saved)
+    env = os.environ.get("SERVER_LAUNCHER_ROOT")
+    if env:
+        candidates.append(env)
+    candidates.extend(
+        [
+            r"Z:\Projects",
+            r"Z:\Projects\\",
+            "Z:/Projects",
+        ]
+    )
+    if sys.platform == "win32":
+        _wake_drive("Z:\\")
+        unc = win32_unc_for("Z:")
+        if unc:
+            candidates.append(os.path.join(unc, "Projects"))
+            candidates.append(unc)
+        mapped = win32_net_use_remote("Z:")
+        if mapped:
+            candidates.append(os.path.join(mapped, "Projects"))
+            candidates.append(mapped)
+        for drive in win32_logical_drives():
+            candidates.append(os.path.join(drive, "Projects"))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+_projects_root_cache: str | None = None
+
+
+def get_projects_root(refresh: bool = False) -> tuple[str | None, str | None]:
+    global _projects_root_cache
+    if not refresh and _projects_root_cache and _dir_accessible(_projects_root_cache):
+        return _projects_root_cache, None
+    for path in _candidate_project_roots():
+        _wake_drive(path)
+        if _dir_accessible(path):
+            _projects_root_cache = path
+            return path, None
+    _projects_root_cache = None
+    return None, r"Z:\Projects not found — click ... and select the Projects folder"
+
+
+def set_projects_root(path: str) -> bool:
+    global _projects_root_cache
+    if not _dir_accessible(path):
+        return False
+    _projects_root_cache = path
+    save_settings({"projects_root": path})
+    return True
+
+
+def normalize_query(text: str) -> str:
+    query = text.strip()
+    if query.upper().startswith("PR#"):
+        query = query[3:]
+    return query.strip()
+
+
+def list_project_names(query: str) -> tuple[list[str], str | None]:
+    query = normalize_query(query)
+    if len(query) < 1:
+        return [], None
+    root, error = get_projects_root()
+    if not root:
+        return [], error
+    prefix = f"PR#{query}".upper()
+    names: list[str] = []
+    try:
+        for name in os.listdir(root):
+            if name.upper().startswith(prefix):
+                names.append(name[3:] if name.upper().startswith("PR#") else name)
+    except OSError as exc:
+        return [], str(exc)
+    names.sort(key=str.upper)
+    return names, None
 
 
 def ui_font(size: int, weight: str = "normal") -> tuple:
@@ -101,34 +292,6 @@ def open_path(path: str) -> None:
 
 def show_error(action: str, exc: BaseException) -> None:
     messagebox.showerror(WINDOW_TITLE, f"Could not open {action}:\n{exc}")
-
-
-def normalize_query(text: str) -> str:
-    query = text.strip()
-    if query.upper().startswith("PR#"):
-        query = query[3:]
-    return query.strip()
-
-
-def list_project_names(query: str) -> tuple[list[str], str | None]:
-    query = normalize_query(query)
-    if len(query) < 2:
-        return [], None
-    if not os.path.isdir(PROJECTS_ROOT):
-        return [], f"{PROJECTS_ROOT} not found"
-    prefix = f"PR#{query}".upper()
-    names: list[str] = []
-    try:
-        for name in os.listdir(PROJECTS_ROOT):
-            full = os.path.join(PROJECTS_ROOT, name)
-            if not os.path.isdir(full):
-                continue
-            if name.upper().startswith(prefix):
-                names.append(name[3:] if name.upper().startswith("PR#") else name)
-    except OSError as exc:
-        return [], str(exc)
-    names.sort(key=str.upper)
-    return names, None
 
 
 def win32_hwnd(widget: tk.Misc) -> int:
@@ -331,6 +494,7 @@ class ServerLauncherApp(tk.Tk):
         self._animate_entrance()
         self._animate()
         self._bind_window_focus()
+        self.after(200, self._connect_projects)
 
     def _set_icons(self) -> None:
         ico = asset_path("icon.ico")
@@ -398,6 +562,18 @@ class ServerLauncherApp(tk.Tk):
         self.search_entry.bind("<Escape>", lambda _e: self._hide_suggestions())
         self.search_entry.bind("<Return>", self._on_search_return)
         self.search_entry.focus_set()
+        browse = tk.Label(
+            row,
+            text="...",
+            bg=PANEL_ALT,
+            fg=TEXT,
+            font=ui_font(11, "bold"),
+            padx=8,
+            pady=4,
+            cursor="hand2",
+        )
+        browse.pack(side="right", padx=(8, 0))
+        browse.bind("<Button-1>", lambda _e: self._choose_projects_folder())
 
         self.suggest_win = tk.Toplevel(self)
         self.suggest_win.withdraw()
@@ -624,16 +800,34 @@ class ServerLauncherApp(tk.Tk):
         return normalize_query(self.search_var.get())
 
     def _project_folder(self) -> str:
-        return os.path.join(PROJECTS_ROOT, f"PR#{self._project_key()}")
+        root = get_projects_root()[0] or DEFAULT_PROJECTS_ROOT
+        return os.path.join(root, f"PR#{self._project_key()}")
 
     def _project_id(self) -> str:
         return f"PR#{self._project_key()}".split("_", 1)[0]
 
     def _set_status(self, text: str, ok: bool = True) -> None:
-        key = self._project_key()
-        prefix = f"PR#{key}  ·  " if key else ""
-        self.status_var.set(prefix + text)
+        self.status_var.set(text)
         self.status.configure(fg=COPPER_HI if ok else DANGER)
+
+    def _connect_projects(self) -> None:
+        root, error = get_projects_root(refresh=True)
+        if root:
+            self._set_status(f"Connected  ·  {root}")
+        else:
+            self._set_status(error or "Projects folder not found — click ... to select it", ok=False)
+
+    def _choose_projects_folder(self) -> None:
+        self._hide_suggestions()
+        initial = get_projects_root()[0] or "Z:\\"
+        selected = filedialog.askdirectory(title="Select Z:\\Projects folder", initialdir=initial)
+        if not selected:
+            return
+        if set_projects_root(selected):
+            self._set_status(f"Connected  ·  {selected}")
+            self._refresh_suggestions()
+        else:
+            self._set_status("Could not open that folder", ok=False)
 
     def _load_recents(self) -> list[dict]:
         path = recents_file()
@@ -841,20 +1035,20 @@ class ServerLauncherApp(tk.Tk):
 
     def _open_tracker(self) -> None:
         self._open_single(
-            os.path.join(PROJECTS_ROOT, "1.0 Project Tracker", f"{self._project_id()}_Tracker.xls"),
+            os.path.join(get_projects_root()[0] or DEFAULT_PROJECTS_ROOT, "1.0 Project Tracker", f"{self._project_id()}_Tracker.xls"),
             "Tracker",
         )
 
     def _open_listlog(self) -> None:
         self._open_single(
-            os.path.join(PROJECTS_ROOT, "2.0 Project Listlog", f"{self._project_id()}_Listlog.xls"),
+            os.path.join(get_projects_root()[0] or DEFAULT_PROJECTS_ROOT, "2.0 Project Listlog", f"{self._project_id()}_Listlog.xls"),
             "List Log",
         )
 
     def _open_scheduler(self) -> None:
         self._open_single(
             os.path.join(
-                PROJECTS_ROOT, "3.0 Drawing Schedular", f"{self._project_id()}_Schedular.xls"
+                get_projects_root()[0] or DEFAULT_PROJECTS_ROOT, "3.0 Drawing Schedular", f"{self._project_id()}_Schedular.xls"
             ),
             "Scheduler",
         )
@@ -862,7 +1056,7 @@ class ServerLauncherApp(tk.Tk):
     def _open_change_order(self) -> None:
         self._open_single(
             os.path.join(
-                PROJECTS_ROOT, "4.0 Project Change_Order", f"{self._project_id()}_Schedular.xls"
+                get_projects_root()[0] or DEFAULT_PROJECTS_ROOT, "4.0 Project Change_Order", f"{self._project_id()}_Schedular.xls"
             ),
             "Change Order",
         )
