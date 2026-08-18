@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import glob
 import json
 import math
 import os
@@ -102,6 +101,66 @@ def open_path(path: str) -> None:
 
 def show_error(action: str, exc: BaseException) -> None:
     messagebox.showerror(WINDOW_TITLE, f"Could not open {action}:\n{exc}")
+
+
+def normalize_query(text: str) -> str:
+    query = text.strip()
+    if query.upper().startswith("PR#"):
+        query = query[3:]
+    return query.strip()
+
+
+def list_project_names(query: str) -> tuple[list[str], str | None]:
+    query = normalize_query(query)
+    if len(query) < 2:
+        return [], None
+    if not os.path.isdir(PROJECTS_ROOT):
+        return [], f"{PROJECTS_ROOT} not found"
+    prefix = f"PR#{query}".upper()
+    names: list[str] = []
+    try:
+        for name in os.listdir(PROJECTS_ROOT):
+            full = os.path.join(PROJECTS_ROOT, name)
+            if not os.path.isdir(full):
+                continue
+            if name.upper().startswith(prefix):
+                names.append(name[3:] if name.upper().startswith("PR#") else name)
+    except OSError as exc:
+        return [], str(exc)
+    names.sort(key=str.upper)
+    return names, None
+
+
+def win32_hwnd(widget: tk.Misc) -> int:
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+
+    hwnd = ctypes.windll.user32.GetParent(widget.winfo_id())
+    return int(hwnd or 0)
+
+
+def win32_force_foreground(widget: tk.Misc) -> None:
+    widget.deiconify()
+    widget.lift()
+    widget.focus_force()
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    hwnd = win32_hwnd(widget)
+    if not hwnd:
+        return
+    user32.ShowWindow(hwnd, 9)
+    foreground = user32.GetForegroundWindow()
+    current_thread = kernel32.GetCurrentThreadId()
+    fg_thread = user32.GetWindowThreadProcessId(foreground, None)
+    user32.AttachThreadInput(fg_thread, current_thread, True)
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    user32.AttachThreadInput(fg_thread, current_thread, False)
 
 
 def load_logo_frames(max_width: int = 118) -> tuple[list, int]:
@@ -262,6 +321,8 @@ class ServerLauncherApp(tk.Tk):
         self._logo_frames: list = []
         self._particles: list[dict] = []
         self._tick = 0.0
+        self._pinned = False
+        self._suggest_visible = False
         self._set_icons()
         self._build_ui()
         self._load_logo()
@@ -269,6 +330,7 @@ class ServerLauncherApp(tk.Tk):
         self._position_window()
         self._animate_entrance()
         self._animate()
+        self._bind_window_focus()
 
     def _set_icons(self) -> None:
         ico = asset_path("icon.ico")
@@ -331,26 +393,32 @@ class ServerLauncherApp(tk.Tk):
             bd=6,
         )
         self.search_entry.pack(fill="x")
-        self.search_entry.bind("<FocusIn>", lambda _e: self.search_border.configure(bg=COPPER))
-        self.search_entry.bind("<FocusOut>", lambda _e: self.search_border.configure(bg=LINE))
-        self.search_entry.bind("<Return>", lambda _e: self._open_working())
+        self.search_entry.bind("<FocusIn>", self._on_search_focus)
+        self.search_entry.bind("<Down>", self._focus_suggestions)
+        self.search_entry.bind("<Escape>", lambda _e: self._hide_suggestions())
+        self.search_entry.bind("<Return>", self._on_search_return)
         self.search_entry.focus_set()
 
+        self.suggest_win = tk.Toplevel(self)
+        self.suggest_win.withdraw()
+        self.suggest_win.overrideredirect(True)
+        self.suggest_win.configure(bg=COPPER)
         self.suggest_list = tk.Listbox(
-            self,
-            height=5,
+            self.suggest_win,
+            height=7,
             font=ui_font(10),
             bg="#1C1814",
             fg=TEXT,
             selectbackground=COPPER,
             selectforeground="#1A1008",
             activestyle="none",
-            highlightthickness=1,
-            highlightcolor=COPPER,
+            highlightthickness=0,
             relief="flat",
             bd=0,
+            exportselection=False,
         )
-        self.suggest_list.bind("<<ListboxSelect>>", self._apply_suggestion)
+        self.suggest_list.pack(fill="both", expand=True, padx=1, pady=1)
+        self.suggest_list.bind("<ButtonRelease-1>", self._apply_suggestion)
         self.suggest_list.bind("<Return>", self._apply_suggestion)
         self.suggest_list.bind("<Escape>", lambda _e: self._hide_suggestions())
         self.bind("<Button-1>", self._on_root_click, add="+")
@@ -395,8 +463,10 @@ class ServerLauncherApp(tk.Tk):
         self.recents_wrap.pack(fill="both", expand=True, padx=1, pady=1)
 
         self.status_var = tk.StringVar(value="Ready")
+        status_bar = tk.Frame(self.stage, bg="#0C0C0C")
+        status_bar.pack(fill="x", side="bottom")
         self.status = tk.Label(
-            self.stage,
+            status_bar,
             textvariable=self.status_var,
             bg="#0C0C0C",
             fg=MUTED,
@@ -405,7 +475,19 @@ class ServerLauncherApp(tk.Tk):
             padx=12,
             pady=6,
         )
-        self.status.pack(fill="x", side="bottom")
+        self.status.pack(side="left", fill="x", expand=True)
+        self.pin_button = tk.Label(
+            status_bar,
+            text="PIN",
+            bg="#0C0C0C",
+            fg=MUTED,
+            font=ui_font(8, "bold"),
+            padx=12,
+            pady=6,
+            cursor="hand2",
+        )
+        self.pin_button.pack(side="right")
+        self.pin_button.bind("<Button-1>", lambda _e: self._toggle_pin())
 
     def _init_particles(self) -> None:
         self._particles = []
@@ -474,6 +556,62 @@ class ServerLauncherApp(tk.Tk):
             button.grid_remove()
             self.after(180 + index * 45, lambda b=button: b.grid())
 
+    def _bind_window_focus(self) -> None:
+        self.bind("<Map>", self._on_map)
+        self.bind("<Unmap>", self._on_unmap)
+        self.bind("<Configure>", self._on_configure)
+        self.bind_all("<Button-1>", self._on_root_click, add="+")
+        if sys.platform == "win32":
+            self.after(200, self._raise_window)
+
+    def _on_unmap(self, event: tk.Event) -> None:
+        if event.widget is self:
+            self._hide_suggestions()
+
+    def _on_map(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        self.after(10, self._raise_window)
+
+    def _raise_window(self) -> None:
+        win32_force_foreground(self)
+        if self._pinned:
+            self.attributes("-topmost", True)
+        else:
+            self.attributes("-topmost", True)
+            self.after(80, lambda: self.attributes("-topmost", False) if not self._pinned else None)
+
+    def _toggle_pin(self) -> None:
+        self._pinned = not self._pinned
+        self.attributes("-topmost", self._pinned)
+        self.pin_button.configure(fg=COPPER_HI if self._pinned else MUTED, text="PINNED" if self._pinned else "PIN")
+        self._set_status("Always on top" if self._pinned else "Pin off")
+
+    def _on_configure(self, event: tk.Event) -> None:
+        if event.widget is self and self._suggest_visible:
+            self.after_idle(self._reposition_suggestions)
+
+    def _on_search_focus(self, _event=None) -> None:
+        self.search_border.configure(bg=COPPER)
+
+    def _on_search_return(self, _event=None):
+        if self._suggest_visible and self.suggest_list.size():
+            if not self.suggest_list.curselection():
+                self.suggest_list.selection_set(0)
+            self._apply_suggestion()
+            return "break"
+        self._open_working()
+        return "break"
+
+    def _focus_suggestions(self, _event=None):
+        self._refresh_suggestions()
+        if self._suggest_visible and self.suggest_list.size():
+            self.suggest_list.focus_set()
+            self.suggest_list.selection_clear(0, tk.END)
+            self.suggest_list.selection_set(0)
+            self.suggest_list.activate(0)
+        return "break"
+
     def _position_window(self) -> None:
         self.update_idletasks()
         width = self.winfo_width()
@@ -483,7 +621,7 @@ class ServerLauncherApp(tk.Tk):
         self.geometry(f"{width}x{height}+{x}+{y}")
 
     def _project_key(self) -> str:
-        return self.search_var.get().strip()
+        return normalize_query(self.search_var.get())
 
     def _project_folder(self) -> str:
         return os.path.join(PROJECTS_ROOT, f"PR#{self._project_key()}")
@@ -580,43 +718,46 @@ class ServerLauncherApp(tk.Tk):
     def _on_search_changed(self, *_args: object) -> None:
         if self._ignore_search:
             return
+        self._refresh_suggestions()
+
+    def _refresh_suggestions(self) -> None:
         text = self.search_var.get()
-        if len(text) <= 1:
+        if len(normalize_query(text)) < 2:
             self._hide_suggestions()
             return
-        try:
-            pattern = os.path.join(PROJECTS_ROOT, f"PR#{text}*")
-            names: list[str] = []
-            for path in sorted(glob.glob(pattern)):
-                if os.path.isdir(path):
-                    folder_name = os.path.basename(path)
-                    if folder_name.upper().startswith("PR#"):
-                        names.append(folder_name[3:])
-            self._show_suggestions(names)
-        except OSError:
+        names, error = list_project_names(text)
+        if error:
             self._hide_suggestions()
+            self._set_status(error, ok=False)
+            return
+        self._show_suggestions(names)
 
     def _show_suggestions(self, names: list[str]) -> None:
         if not names:
             self._hide_suggestions()
             return
         self.suggest_list.delete(0, tk.END)
-        for name in names[:12]:
+        for name in names[:20]:
             self.suggest_list.insert(tk.END, name)
+        self._suggest_visible = True
+        self._reposition_suggestions()
+        self.suggest_win.deiconify()
+        self.suggest_win.lift()
+
+    def _reposition_suggestions(self) -> None:
+        if not self._suggest_visible:
+            return
         self.update_idletasks()
-        entry_x = self.search_entry.winfo_rootx() - self.winfo_rootx()
-        entry_y = self.search_entry.winfo_rooty() - self.winfo_rooty()
-        entry_w = self.search_entry.winfo_width()
-        self.suggest_list.place(
-            x=entry_x,
-            y=entry_y + self.search_entry.winfo_height(),
-            width=max(entry_w, 240),
-            height=min(168, 28 * min(len(names), 6)),
-        )
-        self.suggest_list.lift()
+        x = self.search_entry.winfo_rootx()
+        y = self.search_entry.winfo_rooty() + self.search_entry.winfo_height()
+        width = max(self.search_entry.winfo_width(), 240)
+        count = max(self.suggest_list.size(), 1)
+        height = min(196, 26 * min(count, 7) + 4)
+        self.suggest_win.geometry(f"{width}x{height}+{x}+{y}")
 
     def _hide_suggestions(self) -> None:
-        self.suggest_list.place_forget()
+        self._suggest_visible = False
+        self.suggest_win.withdraw()
 
     def _apply_suggestion(self, _event: object | None = None) -> None:
         selection = self.suggest_list.curselection()
@@ -629,10 +770,18 @@ class ServerLauncherApp(tk.Tk):
         self.search_entry.icursor(tk.END)
         self._hide_suggestions()
         self.search_entry.focus_set()
+        self._set_status(f"Selected PR#{value}")
 
     def _on_root_click(self, event: tk.Event) -> None:
-        if event.widget is not self.suggest_list:
-            self._hide_suggestions()
+        widget = event.widget
+        if widget in (self.search_entry, self.suggest_list, self.search_border):
+            return
+        try:
+            if str(widget).startswith(str(self.suggest_win)):
+                return
+        except (tk.TclError, AttributeError):
+            pass
+        self._hide_suggestions()
 
     def _opened(self, action: str) -> None:
         self._remember_recent()
