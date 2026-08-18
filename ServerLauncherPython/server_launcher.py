@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox
 
 try:
     from PIL import Image, ImageSequence, ImageTk
@@ -155,6 +155,46 @@ def win32_unc_for(drive: str) -> str | None:
     return None
 
 
+def win32_is_elevated() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except OSError:
+        return False
+
+
+def win32_mapped_shares() -> list[tuple[str, str]]:
+    if sys.platform != "win32":
+        return []
+    import winreg
+
+    shares: list[tuple[str, str]] = []
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Network")
+    except OSError:
+        return []
+    index = 0
+    while True:
+        try:
+            letter = winreg.EnumKey(root, index)
+        except OSError:
+            break
+        index += 1
+        try:
+            sub = winreg.OpenKey(root, letter)
+            remote, _typ = winreg.QueryValueEx(sub, "RemotePath")
+            winreg.CloseKey(sub)
+        except OSError:
+            continue
+        if remote:
+            shares.append((letter.upper(), str(remote).rstrip("\\")))
+    winreg.CloseKey(root)
+    return shares
+
+
 def win32_net_use_remote(drive: str) -> str | None:
     if sys.platform != "win32":
         return None
@@ -184,6 +224,10 @@ def _candidate_project_roots() -> list[str]:
     if env:
         raw.append(env)
     if sys.platform == "win32":
+        for letter, unc in win32_mapped_shares():
+            raw.append(os.path.join(unc, "Projects"))
+            raw.append(unc)
+            raw.append(f"{letter}:\\Projects")
         unc = win32_unc_for("Z:") or win32_net_use_remote("Z:")
         if unc:
             raw.append(os.path.join(unc, "Projects"))
@@ -847,20 +891,137 @@ class ServerLauncherApp(tk.Tk):
         root, error = get_projects_root(refresh=True)
         if root:
             self._set_status(f"Connected  ·  {root}")
-        else:
-            self._set_status(error or "Projects folder not found — click ... to select it", ok=False)
+            return
+        if win32_is_elevated():
+            self._set_status(
+                "Running as Administrator hides Z: — close and open the exe normally, or click ...",
+                ok=False,
+            )
+            return
+        self._set_status(error or "Projects folder not found — click ... to connect Rebar_Server", ok=False)
 
     def _choose_projects_folder(self) -> None:
         self._hide_suggestions()
-        initial = get_projects_root()[0] or "Z:\\"
-        selected = filedialog.askdirectory(title="Select Z:\\Projects folder", initialdir=initial)
-        if not selected:
-            return
-        if set_projects_root(selected):
-            self._set_status(f"Connected  ·  {selected}")
-            self._refresh_suggestions()
-        else:
-            self._set_status("Could not open that folder", ok=False)
+        dialog = tk.Toplevel(self)
+        dialog.title("Connect Projects folder")
+        dialog.configure(bg=BG)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("420x360")
+
+        tk.Label(
+            dialog,
+            text="Windows hides mapped Z: in the normal folder picker.\nChoose the Rebar server share here:",
+            bg=BG,
+            fg=MUTED,
+            font=ui_font(9),
+            justify="left",
+            wraplength=390,
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+
+        if win32_is_elevated():
+            tk.Label(
+                dialog,
+                text="This app is running as Administrator, so Z: is hidden.\nClose it and open the exe with a normal double-click.",
+                bg=BG,
+                fg=DANGER,
+                font=ui_font(9),
+                justify="left",
+                wraplength=390,
+            ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        shares = win32_mapped_shares()
+        list_frame = tk.Frame(dialog, bg=LINE)
+        list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        inner = tk.Frame(list_frame, bg=PANEL)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        if not shares:
+            tk.Label(
+                inner,
+                text="No mapped network drives found in Windows.",
+                bg=PANEL,
+                fg=MUTED,
+                font=ui_font(9),
+            ).pack(anchor="w", padx=10, pady=10)
+        for letter, unc in shares:
+            row = tk.Frame(inner, bg=PANEL)
+            row.pack(fill="x", padx=8, pady=6)
+            tk.Label(
+                row,
+                text=f"{letter}:  {unc}",
+                bg=PANEL,
+                fg=TEXT,
+                font=ui_font(10),
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True)
+
+            def connect_share(_event=None, share=unc) -> None:
+                for path in (os.path.join(share, "Projects"), share):
+                    if set_projects_root(path):
+                        dialog.destroy()
+                        self._set_status(f"Connected  ·  {path}")
+                        self._refresh_suggestions()
+                        return
+                self._set_status("Could not open that network folder", ok=False)
+
+            btn = tk.Label(
+                row,
+                text="Connect",
+                bg=COPPER,
+                fg="#1A1008",
+                font=ui_font(9, "bold"),
+                padx=10,
+                pady=4,
+                cursor="hand2",
+            )
+            btn.pack(side="right")
+            btn.bind("<Button-1>", connect_share)
+
+        tk.Label(
+            dialog,
+            text="Or paste the folder path",
+            bg=BG,
+            fg=STEEL,
+            font=ui_font(8, "bold"),
+        ).pack(anchor="w", padx=16)
+        default_path = r"\\192.168.1.109\Rebar_Server\Projects"
+        if shares:
+            default_path = os.path.join(shares[0][1], "Projects")
+        pasted = tk.StringVar(value=default_path)
+        entry = tk.Entry(
+            dialog,
+            textvariable=pasted,
+            font=ui_font(10),
+            bg="#1C1814",
+            fg=TEXT,
+            insertbackground=COPPER_HI,
+            relief="flat",
+        )
+        entry.pack(fill="x", padx=16, pady=(4, 10), ipady=5)
+
+        def connect_pasted() -> None:
+            path = pasted.get().strip()
+            if set_projects_root(path):
+                dialog.destroy()
+                self._set_status(f"Connected  ·  {path}")
+                self._refresh_suggestions()
+            else:
+                self._set_status("Could not open that folder", ok=False)
+
+        tk.Button(
+            dialog,
+            text="Connect path",
+            command=connect_pasted,
+            bg=COPPER,
+            fg="#1A1008",
+            font=ui_font(10, "bold"),
+            relief="flat",
+            padx=12,
+            pady=6,
+        ).pack(padx=16, pady=(0, 16), fill="x")
+        dialog.wait_window()
 
     def _load_recents(self) -> list[dict]:
         path = recents_file()
