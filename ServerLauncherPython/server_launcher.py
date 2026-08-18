@@ -82,33 +82,49 @@ def save_settings(data: dict) -> None:
     settings_file().write_text(json.dumps(current, indent=2), encoding="utf-8")
 
 
-def _dir_accessible(path: str) -> bool:
-    if not path:
-        return False
-    try:
-        os.listdir(path)
-        return True
-    except OSError:
-        pass
-    if sys.platform == "win32":
-        import ctypes
+def drive_to_unc(path: str) -> str | None:
+    if sys.platform != "win32" or not path:
+        return None
+    drive, tail = os.path.splitdrive(path)
+    if len(drive) != 2 or drive[1] != ":":
+        return None
+    remote = win32_unc_for(drive) or win32_net_use_remote(drive)
+    if not remote:
+        return None
+    tail = tail.replace("/", "\\").lstrip("\\")
+    if not tail:
+        return remote.rstrip("\\")
+    return remote.rstrip("\\") + "\\" + tail
 
-        invalid = 0xFFFFFFFF
-        directory = 0x10
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        if attrs != invalid and attrs & directory:
-            return True
-    return False
+
+def try_open_dir(path: str) -> str | None:
+    if not path:
+        return None
+    seen: set[str] = set()
+    for candidate in (drive_to_unc(path), path):
+        if not candidate:
+            continue
+        key = os.path.normcase(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            os.listdir(candidate)
+            return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _dir_accessible(path: str) -> bool:
+    return try_open_dir(path) is not None
 
 
 def _wake_drive(path: str) -> None:
     drive = os.path.splitdrive(path)[0]
     if not drive:
         return
-    try:
-        os.listdir(drive + os.sep)
-    except OSError:
-        pass
+    try_open_dir(drive + "\\")
 
 
 def win32_logical_drives() -> list[str]:
@@ -160,41 +176,33 @@ def win32_net_use_remote(drive: str) -> str | None:
 
 
 def _candidate_project_roots() -> list[str]:
-    candidates: list[str] = []
+    raw: list[str] = []
     saved = load_settings().get("projects_root")
     if saved:
-        candidates.append(saved)
+        raw.append(saved)
     env = os.environ.get("SERVER_LAUNCHER_ROOT")
     if env:
-        candidates.append(env)
-    candidates.extend(
-        [
-            r"Z:\Projects",
-            r"Z:\Projects\\",
-            "Z:/Projects",
-        ]
-    )
+        raw.append(env)
     if sys.platform == "win32":
-        _wake_drive("Z:\\")
-        unc = win32_unc_for("Z:")
+        unc = win32_unc_for("Z:") or win32_net_use_remote("Z:")
         if unc:
-            candidates.append(os.path.join(unc, "Projects"))
-            candidates.append(unc)
-        mapped = win32_net_use_remote("Z:")
-        if mapped:
-            candidates.append(os.path.join(mapped, "Projects"))
-            candidates.append(mapped)
+            raw.append(os.path.join(unc, "Projects"))
+            raw.append(unc)
         for drive in win32_logical_drives():
-            candidates.append(os.path.join(drive, "Projects"))
-    unique: list[str] = []
+            raw.append(os.path.join(drive, "Projects"))
+    raw.extend([r"Z:\Projects", "Z:/Projects"])
+    candidates: list[str] = []
     seen: set[str] = set()
-    for path in candidates:
-        key = os.path.normcase(os.path.normpath(path))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(path)
-    return unique
+    for path in raw:
+        for option in (drive_to_unc(path), path):
+            if not option:
+                continue
+            key = os.path.normcase(os.path.normpath(option))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(option)
+    return candidates
 
 
 _projects_root_cache: str | None = None
@@ -202,23 +210,28 @@ _projects_root_cache: str | None = None
 
 def get_projects_root(refresh: bool = False) -> tuple[str | None, str | None]:
     global _projects_root_cache
-    if not refresh and _projects_root_cache and _dir_accessible(_projects_root_cache):
-        return _projects_root_cache, None
+    if not refresh and _projects_root_cache:
+        working = try_open_dir(_projects_root_cache)
+        if working:
+            _projects_root_cache = working
+            return working, None
     for path in _candidate_project_roots():
-        _wake_drive(path)
-        if _dir_accessible(path):
-            _projects_root_cache = path
-            return path, None
+        working = try_open_dir(path)
+        if working:
+            _projects_root_cache = working
+            save_settings({"projects_root": working})
+            return working, None
     _projects_root_cache = None
-    return None, r"Z:\Projects not found — click ... and select the Projects folder"
+    return None, "Projects folder not found — click ... and select Z:\\Projects"
 
 
 def set_projects_root(path: str) -> bool:
     global _projects_root_cache
-    if not _dir_accessible(path):
+    working = try_open_dir(path)
+    if not working:
         return False
-    _projects_root_cache = path
-    save_settings({"projects_root": path})
+    _projects_root_cache = working
+    save_settings({"projects_root": working})
     return True
 
 
@@ -239,11 +252,18 @@ def list_project_names(query: str) -> tuple[list[str], str | None]:
     prefix = f"PR#{query}".upper()
     names: list[str] = []
     try:
-        for name in os.listdir(root):
-            if name.upper().startswith(prefix):
-                names.append(name[3:] if name.upper().startswith("PR#") else name)
-    except OSError as exc:
-        return [], str(exc)
+        entries = os.listdir(root)
+    except OSError:
+        root, error = get_projects_root(refresh=True)
+        if not root:
+            return [], error or "Projects folder not found — click ... and select Z:\\Projects"
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            return [], "Projects folder not found — click ... and select Z:\\Projects"
+    for name in entries:
+        if name.upper().startswith(prefix):
+            names.append(name[3:] if name.upper().startswith("PR#") else name)
     names.sort(key=str.upper)
     return names, None
 
@@ -281,13 +301,26 @@ def ease_out_cubic(t: float) -> float:
 
 
 def open_path(path: str) -> None:
-    if sys.platform == "win32":
-        os.startfile(path)  # type: ignore[attr-defined]
-        return
-    command = ["open", path] if sys.platform == "darwin" else ["xdg-open", path]
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise OSError(completed.stderr.strip() or f"Could not open {path}")
+    targets = []
+    unc = drive_to_unc(path)
+    if unc:
+        targets.append(unc)
+    targets.append(path)
+    last_error: BaseException | None = None
+    for target in targets:
+        try:
+            if sys.platform == "win32":
+                os.startfile(target)  # type: ignore[attr-defined]
+                return
+            command = ["open", target] if sys.platform == "darwin" else ["xdg-open", target]
+            completed = subprocess.run(command, capture_output=True, text=True)
+            if completed.returncode != 0:
+                raise OSError(completed.stderr.strip() or f"Could not open {target}")
+            return
+        except OSError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
 
 
 def show_error(action: str, exc: BaseException) -> None:
