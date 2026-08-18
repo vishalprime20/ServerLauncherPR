@@ -26,12 +26,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Build EXE
+      - name: Build app folder
         working-directory: ServerLauncherPython
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed `
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --noupx `
             --name ServerLauncherPR `
             --icon assets/icon.ico `
+            --version-file file_version_info.txt `
             --hidden-import PIL `
             --add-data "assets/logo_compact.gif;assets" `
             --add-data "assets/logo_preview.png;assets" `
@@ -40,11 +41,15 @@ jobs:
             --add-data "assets/icon.png;assets" `
             server_launcher.py
 
+      - name: Zip app folder
+        working-directory: ServerLauncherPython/dist
+        run: Compress-Archive -Path ServerLauncherPR -DestinationPath ServerLauncherPR-windows.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ServerLauncherPR-windows
-          path: ServerLauncherPython/dist/ServerLauncherPR.exe
+          path: ServerLauncherPython/dist/ServerLauncherPR-windows.zip
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -52,8 +57,13 @@ jobs:
           tag_name: v1.0.${{ github.run_number }}
           name: Server Launcher v1.0.${{ github.run_number }}
           body: |
-            Download **ServerLauncherPR.exe** and run it on Windows.
+            Windows Defender often blocks a single unsigned `.exe`. This release is a **folder app**.
 
-            The app opens Prime Rebar project folders under `Z:\Projects`.
-          files: ServerLauncherPython/dist/ServerLauncherPR.exe
+            1. Download **ServerLauncherPR-windows.zip**
+            2. Right-click the zip → **Properties** → check **Unblock** → Apply
+            3. Extract the zip
+            4. Open `ServerLauncherPR\ServerLauncherPR.exe` with a normal double-click (not Run as administrator)
+
+            If Defender still blocks it: Windows Security → Virus & threat protection → Protection history → Allow on device.
+          files: ServerLauncherPython/dist/ServerLauncherPR-windows.zip
           make_latest: true
